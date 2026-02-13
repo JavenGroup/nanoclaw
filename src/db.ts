@@ -238,18 +238,37 @@ export function getNewMessages(
 ): { messages: NewMessage[]; newTimestamp: string } {
   if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
 
-  const placeholders = jids.map(() => '?').join(',');
+  // For Telegram JIDs, also match topic-suffixed variants (e.g., tg:-100xxx/567)
+  const conditions: string[] = [];
+  const params: (string | number)[] = [lastTimestamp];
+
+  const nonTgJids = jids.filter((j) => !j.startsWith('tg:'));
+  const tgJids = jids.filter((j) => j.startsWith('tg:'));
+
+  if (nonTgJids.length > 0) {
+    const placeholders = nonTgJids.map(() => '?').join(',');
+    conditions.push(`chat_jid IN (${placeholders})`);
+    params.push(...nonTgJids);
+  }
+
+  for (const tgJid of tgJids) {
+    conditions.push(`(chat_jid = ? OR chat_jid LIKE ?)`);
+    params.push(tgJid, `${tgJid}/%`);
+  }
+
+  if (conditions.length === 0) return { messages: [], newTimestamp: lastTimestamp };
+
+  params.push(`${botPrefix}:%`);
+
   // Filter out bot's own messages by checking content prefix (not is_from_me, since user shares the account)
   const sql = `
     SELECT id, chat_jid, sender, sender_name, content, timestamp
     FROM messages
-    WHERE timestamp > ? AND chat_jid IN (${placeholders}) AND content NOT LIKE ?
+    WHERE timestamp > ? AND (${conditions.join(' OR ')}) AND content NOT LIKE ?
     ORDER BY timestamp
   `;
 
-  const rows = db
-    .prepare(sql)
-    .all(lastTimestamp, ...jids, `${botPrefix}:%`) as NewMessage[];
+  const rows = db.prepare(sql).all(...params) as NewMessage[];
 
   let newTimestamp = lastTimestamp;
   for (const row of rows) {

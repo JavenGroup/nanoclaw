@@ -39,7 +39,7 @@ import { GroupQueue } from './group-queue.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import { Channel, NewMessage, RegisteredGroup, stripTopicSuffix } from './types.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
@@ -108,7 +108,7 @@ export function getAvailableGroups(): import('./container-runner.js').AvailableG
       jid: c.jid,
       name: c.name,
       lastActivity: c.last_message_time,
-      isRegistered: registeredJids.has(c.jid),
+      isRegistered: registeredJids.has(c.jid) || registeredJids.has(stripTopicSuffix(c.jid)),
     }));
 }
 
@@ -122,7 +122,7 @@ export function _setRegisteredGroups(groups: Record<string, RegisteredGroup>): v
  * Called by the GroupQueue when it's this group's turn.
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
-  const group = registeredGroups[chatJid];
+  const group = registeredGroups[chatJid] || registeredGroups[stripTopicSuffix(chatJid)];
   if (!group) return true;
 
   const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
@@ -331,7 +331,7 @@ async function startMessageLoop(): Promise<void> {
         }
 
         for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
+          const group = registeredGroups[chatJid] || registeredGroups[stripTopicSuffix(chatJid)];
           if (!group) continue;
 
           const isMainGroup = group.folder === MAIN_GROUP_FOLDER;

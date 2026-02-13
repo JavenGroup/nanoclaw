@@ -14,7 +14,7 @@ import {
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import { RegisteredGroup, stripTopicSuffix } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -76,7 +76,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
               // Authorization helper
               const isAuthorized = (chatJid: string) => {
-                const targetGroup = registeredGroups[chatJid];
+                const targetGroup = registeredGroups[chatJid] || registeredGroups[stripTopicSuffix(chatJid)];
                 return isMain || (targetGroup && targetGroup.folder === sourceGroup);
               };
 
@@ -225,7 +225,7 @@ export async function processTaskIpc(
       ) {
         // Resolve the target group from JID
         const targetJid = data.targetJid as string;
-        const targetGroupEntry = registeredGroups[targetJid];
+        const targetGroupEntry = registeredGroups[targetJid] || registeredGroups[stripTopicSuffix(targetJid)];
 
         if (!targetGroupEntry) {
           logger.warn(

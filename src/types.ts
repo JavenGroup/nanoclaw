@@ -101,3 +101,13 @@ export type OnInboundMessage = (chatJid: string, message: NewMessage) => void;
 // name is optional — channels that deliver names inline (Telegram) pass it here;
 // channels that sync names separately (WhatsApp syncGroupMetadata) omit it.
 export type OnChatMetadata = (chatJid: string, timestamp: string, name?: string) => void;
+
+/**
+ * Strip topic suffix from a composite JID.
+ * 'tg:-1003897363949/567' -> 'tg:-1003897363949'
+ * '12345@g.us' -> '12345@g.us' (no change — WhatsApp JIDs have no '/')
+ */
+export function stripTopicSuffix(jid: string): string {
+  const slashIdx = jid.indexOf('/');
+  return slashIdx !== -1 ? jid.slice(0, slashIdx) : jid;
+}

@@ -7,7 +7,26 @@ import {
   OnInboundMessage,
   OnChatMetadata,
   RegisteredGroup,
+  stripTopicSuffix,
 } from '../types.js';
+
+/** Build a JID that encodes the topic thread_id when present. */
+function buildTopicJid(chatId: number, threadId?: number): string {
+  return threadId !== undefined ? `tg:${chatId}/${threadId}` : `tg:${chatId}`;
+}
+
+/** Extract numeric chat ID and optional thread_id from a composite JID. */
+function parseTopicJid(jid: string): { chatId: string; threadId: number | undefined } {
+  const raw = jid.replace(/^tg:/, '');
+  const slashIdx = raw.indexOf('/');
+  if (slashIdx !== -1) {
+    return {
+      chatId: raw.slice(0, slashIdx),
+      threadId: parseInt(raw.slice(slashIdx + 1), 10),
+    };
+  }
+  return { chatId: raw, threadId: undefined };
+}
 
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
@@ -39,10 +58,14 @@ export class TelegramChannel implements Channel {
           ? ctx.from?.first_name || 'Private'
           : (ctx.chat as any).title || 'Unknown';
 
-      ctx.reply(
-        `Chat ID: \`tg:${chatId}\`\nName: ${chatName}\nType: ${chatType}`,
-        { parse_mode: 'Markdown' },
-      );
+      const threadId = ctx.message?.message_thread_id;
+      const baseJid = `tg:${chatId}`;
+      let reply = `Chat ID: \`${baseJid}\`\nName: ${chatName}\nType: ${chatType}`;
+      if (threadId !== undefined) {
+        reply += `\nTopic JID: \`${buildTopicJid(chatId, threadId)}\`\nThread ID: ${threadId}`;
+      }
+
+      ctx.reply(reply, { parse_mode: 'Markdown' });
     });
 
     this.bot.command('ping', (ctx) => {
@@ -52,7 +75,8 @@ export class TelegramChannel implements Channel {
     this.bot.on('message:text', async (ctx) => {
       if (ctx.message.text.startsWith('/')) return;
 
-      const chatJid = `tg:${ctx.chat.id}`;
+      const threadId = ctx.message.message_thread_id;
+      const chatJid = buildTopicJid(ctx.chat.id, threadId);
       let content = ctx.message.text;
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
       const senderName =
@@ -86,9 +110,15 @@ export class TelegramChannel implements Channel {
         }
       }
 
+      // Store metadata for both topic JID and base group JID
       this.opts.onChatMetadata(chatJid, timestamp, chatName);
+      const base = stripTopicSuffix(chatJid);
+      if (base !== chatJid) {
+        this.opts.onChatMetadata(base, timestamp, chatName);
+      }
 
-      const group = this.opts.registeredGroups()[chatJid];
+      const groups = this.opts.registeredGroups();
+      const group = groups[chatJid] || groups[base];
       if (!group) {
         logger.debug(
           { chatJid, chatName },
@@ -115,8 +145,10 @@ export class TelegramChannel implements Channel {
 
     // Handle non-text messages with placeholders
     const storeNonText = (ctx: any, placeholder: string) => {
-      const chatJid = `tg:${ctx.chat.id}`;
-      const group = this.opts.registeredGroups()[chatJid];
+      const threadId = ctx.message?.message_thread_id;
+      const chatJid = buildTopicJid(ctx.chat.id, threadId);
+      const groups = this.opts.registeredGroups();
+      const group = groups[chatJid] || groups[stripTopicSuffix(chatJid)];
       if (!group) return;
 
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
@@ -128,6 +160,10 @@ export class TelegramChannel implements Channel {
       const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
 
       this.opts.onChatMetadata(chatJid, timestamp);
+      const base = stripTopicSuffix(chatJid);
+      if (base !== chatJid) {
+        this.opts.onChatMetadata(base, timestamp);
+      }
       this.opts.onMessage(chatJid, {
         id: ctx.message.message_id.toString(),
         chat_jid: chatJid,
@@ -182,15 +218,17 @@ export class TelegramChannel implements Channel {
     }
 
     try {
-      const numericId = jid.replace(/^tg:/, '');
+      const { chatId, threadId } = parseTopicJid(jid);
+      const opts = threadId !== undefined ? { message_thread_id: threadId } : {};
       const MAX_LENGTH = 4096;
       if (text.length <= MAX_LENGTH) {
-        await this.bot.api.sendMessage(numericId, text);
+        await this.bot.api.sendMessage(chatId, text, opts);
       } else {
         for (let i = 0; i < text.length; i += MAX_LENGTH) {
           await this.bot.api.sendMessage(
-            numericId,
+            chatId,
             text.slice(i, i + MAX_LENGTH),
+            opts,
           );
         }
       }
@@ -207,10 +245,11 @@ export class TelegramChannel implements Channel {
     }
 
     try {
-      const numericId = jid.replace(/^tg:/, '');
-      await this.bot.api.sendPhoto(numericId, new InputFile(filePath), {
-        caption: caption || undefined,
-      });
+      const { chatId, threadId } = parseTopicJid(jid);
+      const opts: Record<string, unknown> = {};
+      if (caption) opts.caption = caption;
+      if (threadId !== undefined) opts.message_thread_id = threadId;
+      await this.bot.api.sendPhoto(chatId, new InputFile(filePath), opts);
       logger.info({ jid, filePath }, 'Telegram photo sent');
     } catch (err) {
       logger.error({ jid, filePath, err }, 'Failed to send Telegram photo');
@@ -236,8 +275,9 @@ export class TelegramChannel implements Channel {
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
     if (!this.bot || !isTyping) return;
     try {
-      const numericId = jid.replace(/^tg:/, '');
-      await this.bot.api.sendChatAction(numericId, 'typing');
+      const { chatId, threadId } = parseTopicJid(jid);
+      const opts = threadId !== undefined ? { message_thread_id: threadId } : {};
+      await this.bot.api.sendChatAction(chatId, 'typing', opts);
     } catch (err) {
       logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
     }
