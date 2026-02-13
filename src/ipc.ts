@@ -6,6 +6,7 @@ import { CronExpressionParser } from 'cron-parser';
 import {
   ASSISTANT_NAME,
   DATA_DIR,
+  GROUPS_DIR,
   IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
   TIMEZONE,
@@ -17,6 +18,7 @@ import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendPhoto: (jid: string, filePath: string, caption?: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroupMetadata: (force: boolean) => Promise<void>;
@@ -72,13 +74,14 @@ export function startIpcWatcher(deps: IpcDeps): void {
             const filePath = path.join(messagesDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              // Authorization helper
+              const isAuthorized = (chatJid: string) => {
+                const targetGroup = registeredGroups[chatJid];
+                return isMain || (targetGroup && targetGroup.folder === sourceGroup);
+              };
+
               if (data.type === 'message' && data.chatJid && data.text) {
-                // Authorization: verify this group can send to this chatJid
-                const targetGroup = registeredGroups[data.chatJid];
-                if (
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
+                if (isAuthorized(data.chatJid)) {
                   await deps.sendMessage(
                     data.chatJid,
                     `${ASSISTANT_NAME}: ${data.text}`,
@@ -91,6 +94,39 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
+                  );
+                }
+              } else if (data.type === 'photo' && data.chatJid && data.imagePath) {
+                if (isAuthorized(data.chatJid)) {
+                  // Resolve container path to host path
+                  const containerPath: string = data.imagePath;
+                  let hostPath: string;
+                  if (containerPath.startsWith('/workspace/group/')) {
+                    hostPath = path.join(GROUPS_DIR, sourceGroup, containerPath.slice('/workspace/group/'.length));
+                  } else if (containerPath.startsWith('/workspace/extra/')) {
+                    // Extra mounts — keep relative path but resolve from groups dir
+                    hostPath = path.join(GROUPS_DIR, sourceGroup, containerPath.slice('/workspace/'.length));
+                  } else {
+                    logger.warn({ containerPath, sourceGroup }, 'Photo path not resolvable to host');
+                    fs.unlinkSync(filePath);
+                    continue;
+                  }
+
+                  if (!fs.existsSync(hostPath)) {
+                    logger.warn({ hostPath, containerPath, sourceGroup }, 'Photo file not found on host');
+                    fs.unlinkSync(filePath);
+                    continue;
+                  }
+
+                  await deps.sendPhoto(data.chatJid, hostPath, data.caption);
+                  logger.info(
+                    { chatJid: data.chatJid, sourceGroup, hostPath },
+                    'IPC photo sent',
+                  );
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC photo attempt blocked',
                   );
                 }
               }

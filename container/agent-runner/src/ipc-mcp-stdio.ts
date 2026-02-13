@@ -63,6 +63,43 @@ server.tool(
 );
 
 server.tool(
+  'send_photo',
+  'Send a photo/image to the user or group. The image must be saved to a file under /workspace/group/ first (e.g., via agent-browser screenshot or writing a file). Use this after taking screenshots, generating images, or capturing QR codes.',
+  {
+    image_path: z.string().describe('Absolute path to the image file inside the container (must be under /workspace/)'),
+    caption: z.string().optional().describe('Optional caption text to accompany the image'),
+  },
+  async (args) => {
+    if (!args.image_path.startsWith('/workspace/')) {
+      return {
+        content: [{ type: 'text' as const, text: 'Image path must be under /workspace/ to be accessible by the host.' }],
+        isError: true,
+      };
+    }
+
+    if (!fs.existsSync(args.image_path)) {
+      return {
+        content: [{ type: 'text' as const, text: `Image file not found: ${args.image_path}` }],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'photo',
+      chatJid,
+      imagePath: args.image_path,
+      caption: args.caption || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: 'Photo sent.' }] };
+  },
+);
+
+server.tool(
   'schedule_task',
   `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools.
 
