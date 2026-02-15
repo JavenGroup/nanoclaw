@@ -20,6 +20,7 @@ import {
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
+import { runLumeAgent } from './lume-runner.js';
 import {
   getAllChats,
   getAllRegisteredGroups,
@@ -261,7 +262,8 @@ async function runAgent(
     : undefined;
 
   try {
-    const output = await runContainerAgent(
+    const runner = group.runtime === 'lume' ? runLumeAgent : runContainerAgent;
+    const output = await runner(
       group,
       {
         prompt,
@@ -461,6 +463,15 @@ function ensureContainerSystemRunning(): void {
 
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
+
+  // Check Lume VM if any group uses it
+  try {
+    const { ensureLumeVmRunning } = await import('./lume-runner.js');
+    ensureLumeVmRunning();
+  } catch {
+    // Lume not available — fine if no group uses runtime: 'lume'
+  }
+
   initDatabase();
   logger.info('Database initialized');
   loadState();

@@ -11,7 +11,8 @@ import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
 
-const IPC_DIR = '/workspace/ipc';
+const WORKSPACE_BASE = process.env.WORKSPACE_BASE || '/workspace';
+const IPC_DIR = path.join(WORKSPACE_BASE, 'ipc');
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 
@@ -70,9 +71,9 @@ server.tool(
     caption: z.string().optional().describe('Optional caption text to accompany the image'),
   },
   async (args) => {
-    if (!args.image_path.startsWith('/workspace/')) {
+    if (!args.image_path.startsWith(WORKSPACE_BASE)) {
       return {
-        content: [{ type: 'text' as const, text: 'Image path must be under /workspace/ to be accessible by the host.' }],
+        content: [{ type: 'text' as const, text: `Image path must be under ${WORKSPACE_BASE}/ to be accessible by the host.` }],
         isError: true,
       };
     }

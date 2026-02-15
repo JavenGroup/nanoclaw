@@ -51,6 +51,11 @@ export const TRIGGER_PATTERN = new RegExp(
   'i',
 );
 
+// Lume VM configuration (optional runtime)
+export const LUME_VM_NAME = process.env.LUME_VM_NAME || 'nanoclaw-vm';
+export const LUME_VM_USER = process.env.LUME_VM_USER || 'lume';
+export const LUME_WORKSPACE = process.env.LUME_WORKSPACE || '/Users/lume/workspace';
+
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses system timezone by default
 export const TIMEZONE =

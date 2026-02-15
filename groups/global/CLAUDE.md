@@ -57,20 +57,25 @@ NEVER use markdown. Only use WhatsApp/Telegram formatting:
 
 No ## headings. No [links](url). No **double stars**.
 
-## Anti-Automation Browser Settings
+## Anti-Detection Browser (patchright-browser)
 
-When browsing sites that block headless browsers (e.g., xiaohongshu.com), use these agent-browser launch args:
+For sites that block automation (xiaohongshu.com, taobao.com, etc.), use `patchright-browser` instead of `agent-browser`. It uses Patchright (an undetected Playwright fork) with real macOS GPU — virtually undetectable.
 
 ```bash
-agent-browser open <url> \
-  --args "--disable-blink-features=AutomationControlled,--disable-automation,--disable-dev-shm-usage" \
-  --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+# Browse a protected site
+patchright-browser open "https://www.xiaohongshu.com/explore"
+patchright-browser screenshot    # Screenshot to /tmp/
+patchright-browser text          # Get visible text
+
+# Interact with the page
+patchright-browser click "selector"
+patchright-browser type "selector" "text"
+patchright-browser eval "document.title"
+
+# Close when done
+patchright-browser close
 ```
 
-What these do:
-- `--disable-blink-features=AutomationControlled` — removes the browser automation flag
-- `--disable-automation` — hides the "Chrome is being controlled by automated software" banner
-- `--disable-dev-shm-usage` — prevents shared memory issues in containers
-- Custom User-Agent — mimics a real Chrome browser identity
-
-Always use these flags when a site shows a blank page or blocks access.
+When to use which:
+- `agent-browser` — general browsing, most sites work fine
+- `patchright-browser` — when a site shows blank pages, CAPTCHAs, or blocks `agent-browser`
