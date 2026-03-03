@@ -536,6 +536,13 @@ try {
           for (const el of pointerSet) standard.add(el);
 
           candidates = Array.from(standard);
+          // Sort by DOM order so standard + pointer elements are interleaved naturally
+          candidates.sort((a, b) => {
+            const pos = a.compareDocumentPosition(b);
+            if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+            if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+            return 0;
+          });
         } else {
           candidates = Array.from(document.querySelectorAll('*'));
         }
@@ -753,18 +760,30 @@ try {
     case 'close': {
       const state = loadState();
       if (state?.port && await isCdpAlive(state.port)) {
-        const browser = await chromium.connectOverCDP(`http://127.0.0.1:${state.port}`);
-        await browser.close();
-        clearState();
-        console.log('Browser closed.');
-      } else {
-        // Kill stale process if PID is known
-        if (state?.pid) {
-          try { process.kill(state.pid, 'SIGTERM'); } catch {}
-        }
-        clearState();
-        console.log('No browser running.');
+        try {
+          const browser = await chromium.connectOverCDP(`http://127.0.0.1:${state.port}`);
+          await browser.close(); // Only disconnects CDP, does NOT kill detached process
+        } catch {}
       }
+      // Always kill by PID — connectOverCDP's close() doesn't terminate the process
+      // Use negative PID to kill the entire process group (Chrome + helpers)
+      if (state?.pid) {
+        try { process.kill(-state.pid, 'SIGTERM'); } catch {
+          try { process.kill(state.pid, 'SIGTERM'); } catch {} // Fallback to single process
+        }
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline) {
+          try {
+            process.kill(state.pid, 0); // Check if main process still alive
+            await new Promise(r => setTimeout(r, 200));
+          } catch { break; } // Process exited
+        }
+        try { process.kill(-state.pid, 'SIGKILL'); } catch {
+          try { process.kill(state.pid, 'SIGKILL'); } catch {}
+        }
+      }
+      clearState();
+      console.log(state ? 'Browser closed.' : 'No browser running.');
       break;
     }
 

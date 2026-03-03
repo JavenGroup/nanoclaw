@@ -205,6 +205,22 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           continue;
         }
 
+        // Advance next_run BEFORE enqueuing to prevent duplicate triggers.
+        // Without this, the scheduler loop re-polls every 60s and finds the
+        // same task still "due" while the previous run is in progress (~30min).
+        let nextRun: string | null = null;
+        if (currentTask.schedule_type === 'cron') {
+          const interval = CronExpressionParser.parse(currentTask.schedule_value, {
+            tz: TIMEZONE,
+          });
+          nextRun = interval.next().toISOString();
+        } else if (currentTask.schedule_type === 'interval') {
+          const ms = parseInt(currentTask.schedule_value, 10);
+          nextRun = new Date(Date.now() + ms).toISOString();
+        }
+        // For 'once' tasks, set next_run to null so they won't be picked up again
+        updateTaskAfterRun(currentTask.id, nextRun, 'running');
+
         deps.queue.enqueueTask(
           currentTask.chat_jid,
           currentTask.id,

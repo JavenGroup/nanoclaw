@@ -170,8 +170,23 @@ export function ensureLumeVmRunning(): void {
       `ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no ${LUME_VM_USER}@${ip} 'echo ok'`,
       { timeout: 6000, encoding: 'utf-8' },
     );
-    logger.info({ vm: LUME_VM_NAME, ip }, 'Lume VM already reachable via SSH');
-    return;
+
+    // SSH is up — verify VirtioFS shared directory is actually mounted.
+    // The VM can be running without --shared-dir (e.g. after a lume upgrade restarts
+    // the daemon but not the VM process). In that case, stop and restart with --shared-dir.
+    try {
+      execSync(
+        `ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no ${LUME_VM_USER}@${ip} 'ls /Volumes/My\\ Shared\\ Files/groups >/dev/null 2>&1'`,
+        { timeout: 6000, encoding: 'utf-8' },
+      );
+      logger.info({ vm: LUME_VM_NAME, ip }, 'Lume VM already reachable via SSH');
+      return;
+    } catch {
+      logger.warn({ vm: LUME_VM_NAME, ip }, 'Lume VM reachable but VirtioFS not mounted, restarting with --shared-dir');
+      try { execSync(`lume stop ${LUME_VM_NAME}`, { timeout: 30000 }); } catch {}
+      cachedVmIp = null;
+      // Fall through to start VM with --shared-dir below
+    }
   } catch {
     // SSH not reachable, try to start VM
     cachedVmIp = null;
