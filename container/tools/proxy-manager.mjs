@@ -197,6 +197,12 @@ function readTopicMeta(topic) {
   }
 }
 
+/** Human-readable label: "workspace~t2 (小红书)" or just "workspace~t2" */
+function topicLabel(topic) {
+  const meta = readTopicMeta(topic);
+  return meta?.topicName ? `${topic} (${meta.topicName})` : topic;
+}
+
 function writeProxy(topic, data) {
   const dir = path.join(GROUPS_DIR, topic, BROWSER_DATA_DIR);
   fs.mkdirSync(dir, { recursive: true });
@@ -243,7 +249,7 @@ async function cmdAssign(topic, area, isp) {
   };
 
   writeProxy(topic, proxyData);
-  console.log(`Assigned to ${topic}: ${proxyServer}`);
+  console.log(`Assigned to ${topicLabel(topic)}: ${proxyServer}`);
   console.log(`Real outbound IP: ${result.proxyIp}`);
   console.log(`Area: ${result.area} / ${result.isp}`);
   console.log(`Deadline: ${result.deadline}`);
@@ -270,7 +276,7 @@ async function cmdRenew(topic) {
       continue;
     }
 
-    console.log(`${t}: renewing (${existing.area}/${existing.isp}) ...`);
+    console.log(`${topicLabel(t)}: renewing (${existing.area}/${existing.isp}) ...`);
 
     // Extract new IP with same area + ISP (old IP auto-expires)
     try {
@@ -297,7 +303,7 @@ async function cmdRenew(topic) {
       console.log(`  Real outbound: ${result.proxyIp}`);
       console.log(`  Deadline: ${result.deadline}`);
     } catch (e) {
-      console.error(`  Error renewing ${t}: ${e.message}`);
+      console.error(`  Error renewing ${topicLabel(t)}: ${e.message}`);
     }
   }
 }
@@ -322,9 +328,7 @@ async function cmdList() {
 
   for (const t of topics) {
     const p = readProxy(t);
-    const meta = readTopicMeta(t);
-    const label = meta?.topicName ? `${t} (${meta.topicName})` : t;
-    console.log(`${label.padEnd(30)} ${(p.proxyIp || '?').padEnd(18)} ${(p.area || '?').padEnd(12)} ${(p.isp || '?').padEnd(6)}  deadline: ${p.deadline || 'unknown'}`);
+    console.log(`${topicLabel(t).padEnd(30)} ${(p.proxyIp || '?').padEnd(18)} ${(p.area || '?').padEnd(12)} ${(p.isp || '?').padEnd(6)}  deadline: ${p.deadline || 'unknown'}`);
   }
 }
 
@@ -360,7 +364,7 @@ async function cmdQuery(topic) {
   }
 
   for (const { topic: t, taskId } of taskIds) {
-    console.log(`${t} (task: ${taskId}):`);
+    console.log(`${topicLabel(t)} (task: ${taskId}):`);
     try {
       const ips = await client.queryIP(taskId);
       if (ips.length === 0) {
@@ -389,7 +393,7 @@ async function cmdTest(topic) {
   for (const t of topics) {
     const p = readProxy(t);
     if (!p?.server) {
-      console.log(`${t}: no proxy configured`);
+      console.log(`${topicLabel(t)}: no proxy configured`);
       continue;
     }
 
@@ -397,7 +401,7 @@ async function cmdTest(topic) {
     const serverUrl = p.server.replace(/^socks5:\/\//, '');
     const testUrl = 'http://httpbin.org/ip';
 
-    process.stdout.write(`${t}: testing ${p.proxyIp} (${p.area}/${p.isp}) ... `);
+    process.stdout.write(`${topicLabel(t)}: testing ${p.proxyIp} (${p.area}/${p.isp}) ... `);
 
     try {
       // Try without auth first (IP whitelist), then with auth
