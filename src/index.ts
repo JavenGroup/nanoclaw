@@ -23,6 +23,7 @@ import {
 } from './container-runner.js';
 import { runLumeAgent } from './lume-runner.js';
 import {
+  clearSession,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
@@ -190,7 +191,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
-  const output = await runAgent(group, prompt, chatJid, images.length > 0 ? images : undefined, async (result) => {
+  const effectiveFolder = getEffectiveFolder(group.folder, chatJid);
+  let streamError = '';
+  const agentResult = await runAgent(group, prompt, chatJid, images.length > 0 ? images : undefined, async (result) => {
     // Streaming output callback — called for each agent result
     if (result.result) {
       const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
@@ -208,27 +211,53 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
     if (result.status === 'error') {
       hadError = true;
+      if (result.error) streamError = result.error;
     }
   });
 
   if (channel?.setTyping) await channel.setTyping(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
-  if (output === 'error' || hadError) {
+  if (agentResult.status === 'error' || hadError) {
     // If we already sent output to the user, don't roll back the cursor —
     // the user got their response and re-processing would send duplicates.
     if (outputSentToUser) {
       logger.warn({ group: group.name }, 'Agent error after output was sent, skipping cursor rollback to prevent duplicates');
       return true;
     }
+
+    // Classify error and pick user-facing message
+    const errorMsg = agentResult.error || streamError || '';
+    let userMessage: string;
+
+    if (/rate.limit|overloaded|529|too many requests/i.test(errorMsg)) {
+      userMessage = '[API rate limited, retrying...]';
+    } else if (/session|resume|exit.*code 1|error_during_execution/i.test(errorMsg)) {
+      userMessage = '[Session error, starting fresh...]';
+      // Clear broken session so next retry creates a new one
+      clearSession(effectiveFolder);
+      delete sessions[effectiveFolder];
+      logger.warn({ group: group.name, effectiveFolder }, 'Cleared broken session');
+    } else {
+      userMessage = '[Agent error, retrying...]';
+    }
+
+    if (channel) {
+      await channel.sendMessage(chatJid, userMessage);
+    }
     // Roll back cursor so retries can re-process these messages
     lastAgentTimestamp[chatJid] = previousCursor;
     saveState();
-    logger.warn({ group: group.name }, 'Agent error, rolled back message cursor for retry');
+    logger.warn({ group: group.name, error: errorMsg }, 'Agent error, rolled back message cursor for retry');
     return false;
   }
 
   return true;
+}
+
+interface AgentResult {
+  status: 'success' | 'error';
+  error?: string;
 }
 
 async function runAgent(
@@ -237,7 +266,7 @@ async function runAgent(
   chatJid: string,
   images?: Array<{ relativePath: string; mediaType: string }>,
   onOutput?: (output: ContainerOutput) => Promise<void>,
-): Promise<'success' | 'error'> {
+): Promise<AgentResult> {
   const effectiveFolder = getEffectiveFolder(group.folder, chatJid);
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const sessionId = sessions[effectiveFolder];
@@ -304,13 +333,14 @@ async function runAgent(
         { group: group.name, error: output.error },
         'Container agent error',
       );
-      return 'error';
+      return { status: 'error', error: output.error };
     }
 
-    return 'success';
+    return { status: 'success' };
   } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error({ group: group.name, err }, 'Agent error');
-    return 'error';
+    return { status: 'error', error: errorMsg };
   }
 }
 

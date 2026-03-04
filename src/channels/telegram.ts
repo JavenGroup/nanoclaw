@@ -43,7 +43,7 @@ export interface TelegramChannelOpts {
 interface PendingMessage {
   chatJid: string;
   timestamp: string;
-  msg: import('../types.js').NewMessage;
+  msgPromise: Promise<import('../types.js').NewMessage>;
 }
 
 export class TelegramChannel implements Channel {
@@ -80,13 +80,22 @@ export class TelegramChannel implements Channel {
     }
   }
 
-  private flushMediaGroup(mediaGroupId: string): void {
+  private async flushMediaGroup(mediaGroupId: string): Promise<void> {
     const group = this.mediaGroupBuffer.get(mediaGroupId);
     if (!group) return;
     this.mediaGroupBuffer.delete(mediaGroupId);
 
-    logger.info({ mediaGroupId, count: group.items.length }, 'Flushing media group');
-    for (const pending of group.items) {
+    // Wait for all downloads to finish before dispatching any messages
+    const resolved = await Promise.all(
+      group.items.map(async (pending) => ({
+        chatJid: pending.chatJid,
+        timestamp: pending.timestamp,
+        msg: await pending.msgPromise,
+      })),
+    );
+
+    logger.info({ mediaGroupId, count: resolved.length }, 'Flushing media group');
+    for (const pending of resolved) {
       this.opts.onChatMetadata(pending.chatJid, pending.timestamp);
       const base = stripTopicSuffix(pending.chatJid);
       if (base !== pending.chatJid) {
@@ -230,7 +239,7 @@ export class TelegramChannel implements Channel {
 
       const mediaGroupId = ctx.message?.media_group_id as string | undefined;
       if (mediaGroupId) {
-        this.bufferMediaGroupMessage(mediaGroupId, { chatJid, timestamp, msg });
+        this.bufferMediaGroupMessage(mediaGroupId, { chatJid, timestamp, msgPromise: Promise.resolve(msg) });
       } else {
         this.opts.onChatMetadata(chatJid, timestamp);
         const base = stripTopicSuffix(chatJid);
@@ -259,55 +268,51 @@ export class TelegramChannel implements Channel {
         'Unknown';
       const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
       const msgId = ctx.message.message_id.toString();
+      const sender = ctx.from?.id?.toString() || '';
 
       // Get largest photo resolution (last element in the array)
       const photos = ctx.message.photo;
       const largest = photos[photos.length - 1];
-      let imagePaths: string[] | undefined;
 
-      try {
-        const file = await ctx.api.getFile(largest.file_id);
-        if (file.file_path) {
-          const url = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
-          const resp = await fetch(url);
-          if (resp.ok) {
-            const safeChatJid = chatJid.replace(/[^a-zA-Z0-9-]/g, '_');
-            const photoDir = path.join(DATA_DIR, 'photos', safeChatJid);
-            fs.mkdirSync(photoDir, { recursive: true });
-            const ext = path.extname(file.file_path) || '.jpg';
-            const localFile = path.join(photoDir, `${msgId}${ext}`);
-            const buffer = Buffer.from(await resp.arrayBuffer());
-            fs.writeFileSync(localFile, buffer);
-
-            // Relative path from project root for ContainerInput
-            const relativePath = path.relative(process.cwd(), localFile);
-            imagePaths = [relativePath];
-            logger.info({ chatJid, localFile, size: buffer.length }, 'Telegram photo downloaded');
-          } else {
-            logger.warn({ chatJid, status: resp.status }, 'Failed to download Telegram photo');
+      const downloadAndBuildMsg = async (): Promise<import('../types.js').NewMessage> => {
+        let imagePaths: string[] | undefined;
+        try {
+          const file = await ctx.api.getFile(largest.file_id);
+          if (file.file_path) {
+            const url = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+            const resp = await fetch(url);
+            if (resp.ok) {
+              const safeChatJid = chatJid.replace(/[^a-zA-Z0-9-]/g, '_');
+              const photoDir = path.join(DATA_DIR, 'photos', safeChatJid);
+              fs.mkdirSync(photoDir, { recursive: true });
+              const ext = path.extname(file.file_path) || '.jpg';
+              const localFile = path.join(photoDir, `${msgId}${ext}`);
+              const buffer = Buffer.from(await resp.arrayBuffer());
+              fs.writeFileSync(localFile, buffer);
+              const relativePath = path.relative(process.cwd(), localFile);
+              imagePaths = [relativePath];
+              logger.info({ chatJid, localFile, size: buffer.length }, 'Telegram photo downloaded');
+            } else {
+              logger.warn({ chatJid, status: resp.status }, 'Failed to download Telegram photo');
+            }
           }
+        } catch (err) {
+          logger.error({ chatJid, err }, 'Error downloading Telegram photo');
         }
-      } catch (err) {
-        logger.error({ chatJid, err }, 'Error downloading Telegram photo');
-      }
-
-      const photoRef = imagePaths ? `[Photo: ${imagePaths[0]}]` : '[Photo]';
-
-      const msg: import('../types.js').NewMessage = {
-        id: msgId,
-        chat_jid: chatJid,
-        sender: ctx.from?.id?.toString() || '',
-        sender_name: senderName,
-        content: `${photoRef}${caption}`,
-        timestamp,
-        is_from_me: false,
-        imagePaths,
+        const photoRef = imagePaths ? `[Photo: ${imagePaths[0]}]` : '[Photo]';
+        return {
+          id: msgId, chat_jid: chatJid, sender, sender_name: senderName,
+          content: `${photoRef}${caption}`, timestamp, is_from_me: false, imagePaths,
+        };
       };
 
       const mediaGroupId = (ctx.message as any).media_group_id as string | undefined;
       if (mediaGroupId) {
-        this.bufferMediaGroupMessage(mediaGroupId, { chatJid, timestamp, msg });
+        // Register in buffer immediately (before download starts) so the debounce
+        // timer sees all messages in the group; flush awaits all promises.
+        this.bufferMediaGroupMessage(mediaGroupId, { chatJid, timestamp, msgPromise: downloadAndBuildMsg() });
       } else {
+        const msg = await downloadAndBuildMsg();
         this.opts.onChatMetadata(chatJid, timestamp);
         const base = stripTopicSuffix(chatJid);
         if (base !== chatJid) {
@@ -407,53 +412,51 @@ export class TelegramChannel implements Channel {
         'Unknown';
       const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
       const msgId = ctx.message.message_id.toString();
+      const sender = ctx.from?.id?.toString() || '';
 
-      let placeholder = `[Document: ${originalName}]`;
+      const downloadAndBuildMsg = async (): Promise<import('../types.js').NewMessage> => {
+        let placeholder = `[Document: ${originalName}]`;
 
-      // Telegram Bot API has a 20MB limit on getFile()
-      if (doc?.file_size && doc.file_size > 20 * 1024 * 1024) {
-        logger.warn({ chatJid, fileName: originalName, fileSize: doc.file_size }, 'Document exceeds 20MB Telegram Bot API limit, skipping download');
-      } else if (fileId) {
-        try {
-          const file = await ctx.api.getFile(fileId);
-          if (file.file_path) {
-            const url = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
-            const resp = await fetch(url);
-            if (resp.ok) {
-              const safeChatJid = chatJid.replace(/[^a-zA-Z0-9-]/g, '_');
-              const fileDir = path.join(DATA_DIR, 'files', safeChatJid);
-              fs.mkdirSync(fileDir, { recursive: true });
-              const safeName = originalName.replace(/[/\\]/g, '_');
-              const localFile = path.join(fileDir, `${msgId}_${safeName}`);
-              const buffer = Buffer.from(await resp.arrayBuffer());
-              fs.writeFileSync(localFile, buffer);
-
-              const relativePath = path.relative(process.cwd(), localFile);
-              placeholder = `[File: ${relativePath}]`;
-              logger.info({ chatJid, localFile, size: buffer.length, fileName: originalName }, 'Telegram document downloaded');
-            } else {
-              logger.warn({ chatJid, status: resp.status, fileName: originalName }, 'Failed to download Telegram document');
+        // Telegram Bot API has a 20MB limit on getFile()
+        if (doc?.file_size && doc.file_size > 20 * 1024 * 1024) {
+          logger.warn({ chatJid, fileName: originalName, fileSize: doc.file_size }, 'Document exceeds 20MB Telegram Bot API limit, skipping download');
+        } else if (fileId) {
+          try {
+            const file = await ctx.api.getFile(fileId);
+            if (file.file_path) {
+              const url = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+              const resp = await fetch(url);
+              if (resp.ok) {
+                const safeChatJid = chatJid.replace(/[^a-zA-Z0-9-]/g, '_');
+                const fileDir = path.join(DATA_DIR, 'files', safeChatJid);
+                fs.mkdirSync(fileDir, { recursive: true });
+                const safeName = originalName.replace(/[/\\]/g, '_');
+                const localFile = path.join(fileDir, `${msgId}_${safeName}`);
+                const buffer = Buffer.from(await resp.arrayBuffer());
+                fs.writeFileSync(localFile, buffer);
+                const relativePath = path.relative(process.cwd(), localFile);
+                placeholder = `[File: ${relativePath}]`;
+                logger.info({ chatJid, localFile, size: buffer.length, fileName: originalName }, 'Telegram document downloaded');
+              } else {
+                logger.warn({ chatJid, status: resp.status, fileName: originalName }, 'Failed to download Telegram document');
+              }
             }
+          } catch (err) {
+            logger.error({ chatJid, err, fileName: originalName }, 'Error downloading Telegram document');
           }
-        } catch (err) {
-          logger.error({ chatJid, err, fileName: originalName }, 'Error downloading Telegram document');
         }
-      }
 
-      const msg: import('../types.js').NewMessage = {
-        id: msgId,
-        chat_jid: chatJid,
-        sender: ctx.from?.id?.toString() || '',
-        sender_name: senderName,
-        content: `${placeholder}${caption}`,
-        timestamp,
-        is_from_me: false,
+        return {
+          id: msgId, chat_jid: chatJid, sender, sender_name: senderName,
+          content: `${placeholder}${caption}`, timestamp, is_from_me: false,
+        };
       };
 
       const mediaGroupId = (ctx.message as any).media_group_id as string | undefined;
       if (mediaGroupId) {
-        this.bufferMediaGroupMessage(mediaGroupId, { chatJid, timestamp, msg });
+        this.bufferMediaGroupMessage(mediaGroupId, { chatJid, timestamp, msgPromise: downloadAndBuildMsg() });
       } else {
+        const msg = await downloadAndBuildMsg();
         this.opts.onChatMetadata(chatJid, timestamp);
         const base = stripTopicSuffix(chatJid);
         if (base !== chatJid) {

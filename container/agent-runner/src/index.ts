@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
@@ -62,6 +63,10 @@ const WORKSPACE_BASE = process.env.WORKSPACE_BASE || '/workspace';
 const IPC_INPUT_DIR = path.join(WORKSPACE_BASE, 'ipc/input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
+
+// Session trim constants
+const RECENT_MESSAGES_KEEP = 20;
+const TRIM_MIN_ENTRIES = 30;  // fewer than 30 entries → skip trim
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -263,6 +268,282 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
   return lines.join('\n');
 }
 
+// --- Post-query image stripping (microcompaction) ---
+
+const IMAGE_PLACEHOLDER = '[image stripped]';
+
+function stripSessionImages(sessionId: string): void {
+  const sessionPath = getSessionFilePath(sessionId);
+  if (!sessionPath) return;
+
+  try {
+    const content = fs.readFileSync(sessionPath, 'utf-8');
+    let strippedCount = 0;
+    let savedBytes = 0;
+
+    const newLines = content.split('\n').map(line => {
+      if (!line.trim()) return line;
+      try {
+        const entry = JSON.parse(line);
+
+        // Strip images from user messages (which contain tool_result images)
+        if (entry.type === 'user' && entry.message?.content && Array.isArray(entry.message.content)) {
+          let modified = false;
+          const newContent = entry.message.content.map((block: Record<string, unknown>) => {
+            // Direct image blocks
+            if (block.type === 'image' && (block.source as Record<string, unknown>)?.data) {
+              const data = (block.source as Record<string, string>).data;
+              savedBytes += data.length;
+              strippedCount++;
+              modified = true;
+              return { type: 'text', text: IMAGE_PLACEHOLDER };
+            }
+            // tool_result blocks containing images
+            if (block.type === 'tool_result' && Array.isArray(block.content)) {
+              const newSubContent = (block.content as Array<Record<string, unknown>>).map(sub => {
+                if (sub.type === 'image' && (sub.source as Record<string, unknown>)?.data) {
+                  const data = (sub.source as Record<string, string>).data;
+                  savedBytes += data.length;
+                  strippedCount++;
+                  modified = true;
+                  return { type: 'text', text: IMAGE_PLACEHOLDER };
+                }
+                return sub;
+              });
+              return { ...block, content: newSubContent };
+            }
+            return block;
+          });
+          if (modified) {
+            entry.message.content = newContent;
+            return JSON.stringify(entry);
+          }
+        }
+
+        // Strip images from assistant messages (vision tool results cached)
+        if (entry.type === 'assistant' && entry.message?.content && Array.isArray(entry.message.content)) {
+          let modified = false;
+          const newContent = entry.message.content.map((block: Record<string, unknown>) => {
+            if (block.type === 'image' && (block.source as Record<string, unknown>)?.data) {
+              const data = (block.source as Record<string, string>).data;
+              savedBytes += data.length;
+              strippedCount++;
+              modified = true;
+              return { type: 'text', text: IMAGE_PLACEHOLDER };
+            }
+            return block;
+          });
+          if (modified) {
+            entry.message.content = newContent;
+            return JSON.stringify(entry);
+          }
+        }
+      } catch { /* not JSON, keep as-is */ }
+      return line;
+    });
+
+    if (strippedCount > 0) {
+      fs.writeFileSync(sessionPath, newLines.join('\n'));
+      const newSize = fs.statSync(sessionPath).size;
+      log(`Stripped ${strippedCount} images from session (saved ${(savedBytes / 1024 / 1024).toFixed(1)}MB, new size: ${(newSize / 1024 / 1024).toFixed(1)}MB)`);
+    }
+  } catch (err) {
+    log(`Failed to strip session images: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+function getSessionFilePath(sessionId: string): string | null {
+  const home = process.env.HOME || `/Users/${process.env.USER || 'lume'}`;
+  const claudeDir = path.join(home, '.claude', 'projects');
+
+  if (!fs.existsSync(claudeDir)) return null;
+
+  try {
+    for (const projDir of fs.readdirSync(claudeDir)) {
+      const candidate = path.join(claudeDir, projDir, `${sessionId}.jsonl`);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function getSessionFileSize(sessionId: string): number {
+  const filePath = getSessionFilePath(sessionId);
+  if (!filePath) return 0;
+  try {
+    return fs.statSync(filePath).size;
+  } catch {
+    return 0;
+  }
+}
+
+// --- Session Sliding Window Trim ---
+
+async function generateSummary(
+  existingSummary: string,
+  droppedText: string,
+): Promise<string | null> {
+  const prompt = existingSummary
+    ? `Update this conversation summary to include the new messages being archived.
+
+Current summary:
+${existingSummary}
+
+New messages to incorporate:
+${droppedText}
+
+Output the updated summary (under 2000 chars). Use the same language as the conversation.`
+    : `Summarize this conversation history concisely (under 2000 chars). Include: user identity, key decisions, ongoing tasks, important context. Use the same language as the conversation.
+
+${droppedText}`;
+
+  let result: string | undefined;
+  try {
+    for await (const message of query({
+      prompt,
+      options: {
+        cwd: path.join(WORKSPACE_BASE, 'group'),
+        model: 'claude-sonnet-4-5-20250929',
+        maxTurns: 1,
+        permissionMode: 'plan',
+        allowedTools: [],
+      }
+    })) {
+      if (message.type === 'assistant' && 'message' in message) {
+        const content = (message as { message?: { content?: Array<{ type: string; text?: string }> } }).message?.content;
+        if (Array.isArray(content)) {
+          result = content.filter((c: { type: string; text?: string }) => c.type === 'text').map((c: { type: string; text?: string }) => c.text || '').join('');
+        }
+      }
+    }
+  } catch (err) {
+    log(`Summary generation failed: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+  return result || null;
+}
+
+async function trimSession(sessionId: string): Promise<void> {
+  const sessionPath = getSessionFilePath(sessionId);
+  if (!sessionPath) return;
+
+  const content = fs.readFileSync(sessionPath, 'utf-8');
+  const lines = content.split('\n').filter(l => l.trim());
+
+  // Separate headers (queue-operation) from conversation entries
+  const headers: string[] = [];
+  const conversationEntries: Array<{ line: string; parsed: Record<string, unknown> }> = [];
+
+  for (const line of lines) {
+    try {
+      const obj = JSON.parse(line);
+      if (obj.type === 'queue-operation') {
+        headers.push(line);
+      } else {
+        conversationEntries.push({ line, parsed: obj });
+      }
+    } catch {
+      headers.push(line); // non-JSON lines go with headers
+    }
+  }
+
+  if (conversationEntries.length < TRIM_MIN_ENTRIES) {
+    log(`Session has ${conversationEntries.length} entries (< ${TRIM_MIN_ENTRIES}), skip trim`);
+    return;
+  }
+
+  // Split: older + recent
+  const recent = conversationEntries.slice(-RECENT_MESSAGES_KEEP);
+  const older = conversationEntries.slice(0, -RECENT_MESSAGES_KEEP);
+
+  // Extract existing summary (if previously trimmed, first entry may be a summary)
+  let existingSummary = '';
+  const olderForSummary: Array<{ line: string; parsed: Record<string, unknown> }> = [];
+  for (const entry of older) {
+    if (entry.parsed._nanoclaw_summary) {
+      const msg = entry.parsed.message as { content?: string } | undefined;
+      existingSummary = msg?.content || '';
+    } else {
+      olderForSummary.push(entry);
+    }
+  }
+
+  // Format dropped messages as text for summarization
+  const droppedText = olderForSummary.map(e => {
+    const p = e.parsed;
+    const role = p.type === 'user' ? 'User' : 'Assistant';
+    const msg = (p.message as { content?: unknown })?.content;
+    let text = '';
+    if (typeof msg === 'string') text = msg;
+    else if (Array.isArray(msg)) {
+      text = msg.filter((b: { type: string }) => b.type === 'text').map((b: { text?: string }) => b.text || '').join('');
+    }
+    return `${role}: ${text.slice(0, 500)}`;
+  }).filter(t => t.length > 10).join('\n');
+
+  if (!droppedText && !existingSummary) {
+    log('No content to summarize, skip trim');
+    return;
+  }
+
+  // Generate / update summary
+  const summaryText = await generateSummary(existingSummary, droppedText);
+  if (!summaryText) return;
+
+  // Build fake summary entries
+  const fakeUserUuid = crypto.randomUUID();
+  const fakeAsstUuid = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const template = recent[0]?.parsed || {};
+
+  const fakeUser = {
+    type: 'user',
+    message: { role: 'user', content: `[SESSION CONTEXT — Summarized history of earlier conversation]\n\n${summaryText}` },
+    uuid: fakeUserUuid,
+    parentUuid: undefined,
+    sessionId,
+    timestamp: now,
+    cwd: template.cwd,
+    version: template.version,
+    isSidechain: false,
+    userType: 'external',
+    _nanoclaw_summary: true,
+  };
+
+  const fakeAsst = {
+    type: 'assistant',
+    message: { role: 'assistant', content: [{ type: 'text', text: 'Context loaded.' }] },
+    uuid: fakeAsstUuid,
+    parentUuid: fakeUserUuid,
+    sessionId,
+    timestamp: now,
+    cwd: template.cwd,
+    version: template.version,
+    isSidechain: false,
+    userType: 'external',
+  };
+
+  // Patch first recent entry's parentUuid to chain after fake assistant
+  const firstRecent = { ...recent[0].parsed };
+  firstRecent.parentUuid = fakeAsstUuid;
+
+  // Write to temp file first, then rename (crash safety)
+  const newLines = [
+    ...headers,
+    JSON.stringify(fakeUser),
+    JSON.stringify(fakeAsst),
+    JSON.stringify(firstRecent),
+    ...recent.slice(1).map(e => e.line),
+  ];
+
+  const tmpPath = sessionPath + '.trim.tmp';
+  fs.writeFileSync(tmpPath, newLines.join('\n') + '\n');
+  fs.renameSync(tmpPath, sessionPath);
+
+  const newSize = fs.statSync(sessionPath).size;
+  log(`Trimmed session: ${conversationEntries.length} → ${RECENT_MESSAGES_KEEP + 2} entries, ${older.length} summarized, new size: ${(newSize / 1024).toFixed(0)}KB`);
+}
+
 /**
  * Check for _close sentinel.
  */
@@ -439,11 +720,20 @@ async function runQuery(
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
       log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
-      writeOutput({
-        status: 'success',
-        result: textResult || null,
-        newSessionId
-      });
+
+      // Detect retryable API errors (rate limit / overloaded) — report as error
+      // so the host-side retry logic (exponential backoff) kicks in automatically.
+      const isRetryable = textResult && /rate.limit|overloaded|529|too many requests/i.test(textResult);
+      if (isRetryable) {
+        log('Retryable API error detected, signaling error for host retry');
+        writeOutput({ status: 'error', result: null, newSessionId });
+      } else {
+        writeOutput({
+          status: 'success',
+          result: textResult || null,
+          newSessionId
+        });
+      }
     }
   }
 
@@ -526,16 +816,39 @@ async function main(): Promise<void> {
 
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
+  let retriedWithoutSession = false;
   try {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(initialPrompt, sessionId, mcpServerPath, containerInput, resumeAt);
+      let queryResult;
+      try {
+        queryResult = await runQuery(initialPrompt, sessionId, mcpServerPath, containerInput, resumeAt);
+      } catch (err) {
+        // Resume failed — fallback to new session (try once)
+        if (sessionId && !retriedWithoutSession) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          log(`Query failed with session ${sessionId}, retrying without resume: ${errMsg}`);
+          sessionId = undefined;
+          resumeAt = undefined;
+          retriedWithoutSession = true;
+          continue;
+        }
+        throw err;
+      }
+      retriedWithoutSession = false;
+
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }
       if (queryResult.lastAssistantUuid) {
         resumeAt = queryResult.lastAssistantUuid;
+      }
+
+      // Strip base64 images from session JSONL after each query
+      // Screenshots served their purpose during the query; no need to reload on resume
+      if (sessionId) {
+        stripSessionImages(sessionId);
       }
 
       // If _close was consumed during the query, exit immediately.
@@ -571,6 +884,15 @@ async function main(): Promise<void> {
       error: errorMessage
     });
     process.exit(1);
+  }
+
+  // Trim session at shutdown (sliding window compaction, non-fatal)
+  if (sessionId) {
+    try {
+      await trimSession(sessionId);
+    } catch (err) {
+      log(`Session trim failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 }
 

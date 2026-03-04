@@ -11,7 +11,7 @@ interface QueuedTask {
   fn: () => Promise<void>;
 }
 
-const MAX_RETRIES = 5;
+const MAX_RETRIES = 3;
 const BASE_RETRY_MS = 5000;
 
 interface GroupState {
