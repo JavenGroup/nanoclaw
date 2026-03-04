@@ -11,8 +11,38 @@ import {
   OnInboundMessage,
   OnChatMetadata,
   RegisteredGroup,
+  getEffectiveFolder,
   stripTopicSuffix,
 } from '../types.js';
+
+const GROUPS_DIR = path.join(DATA_DIR, '..', 'groups');
+
+/** Save or update .topic-meta.json for a workspace directory. */
+function saveTopicMeta(
+  groupFolder: string,
+  threadId: number,
+  fields: Record<string, unknown>,
+): void {
+  const effectiveFolder = `${groupFolder}~t${threadId}`;
+  const metaPath = path.join(GROUPS_DIR, effectiveFolder, '.topic-meta.json');
+  let existing: Record<string, unknown> = {};
+  try {
+    existing = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+  } catch {}
+  const merged = { ...existing, threadId, ...fields, updatedAt: new Date().toISOString() };
+  fs.mkdirSync(path.dirname(metaPath), { recursive: true });
+  fs.writeFileSync(metaPath, JSON.stringify(merged, null, 2));
+}
+
+/** Read .topic-meta.json for a workspace directory. Returns null if missing. */
+export function readTopicMeta(effectiveFolder: string): Record<string, unknown> | null {
+  const metaPath = path.join(GROUPS_DIR, effectiveFolder, '.topic-meta.json');
+  try {
+    return JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
 
 /** Build a JID that encodes the topic thread_id when present. */
 function buildTopicJid(chatId: number, threadId?: number): string {
@@ -184,6 +214,15 @@ export class TelegramChannel implements Channel {
 
       const groups = this.opts.registeredGroups();
       const group = groups[chatJid] || groups[base];
+
+      // Ensure .topic-meta.json exists for topic workspaces
+      if (group && threadId !== undefined) {
+        const ef = getEffectiveFolder(group.folder, chatJid);
+        if (!readTopicMeta(ef)) {
+          saveTopicMeta(group.folder, threadId, { topicName: null });
+        }
+      }
+
       if (!group) {
         logger.warn(
           { chatJid, chatName, chatType: ctx.chat.type, isForum: (ctx.chat as any).is_forum },
@@ -471,6 +510,37 @@ export class TelegramChannel implements Channel {
     });
     this.bot.on('message:location', (ctx) => storeNonText(ctx, '[Location]'));
     this.bot.on('message:contact', (ctx) => storeNonText(ctx, '[Contact]'));
+
+    // Capture topic names from forum events
+    this.bot.on('message:forum_topic_created', (ctx) => {
+      const threadId = ctx.message.message_thread_id;
+      const topicName = (ctx.message.forum_topic_created as any)?.name;
+      if (!threadId || !topicName) return;
+
+      const chatJid = buildTopicJid(ctx.chat.id, threadId);
+      const base = stripTopicSuffix(chatJid);
+      const groups = this.opts.registeredGroups();
+      const group = groups[chatJid] || groups[base];
+      if (!group) return;
+
+      saveTopicMeta(group.folder, threadId, { topicName });
+      logger.info({ threadId, topicName, folder: group.folder }, 'Forum topic created — saved meta');
+    });
+
+    this.bot.on('message:forum_topic_edited', (ctx) => {
+      const threadId = ctx.message.message_thread_id;
+      const topicName = (ctx.message.forum_topic_edited as any)?.name;
+      if (!threadId || !topicName) return;
+
+      const chatJid = buildTopicJid(ctx.chat.id, threadId);
+      const base = stripTopicSuffix(chatJid);
+      const groups = this.opts.registeredGroups();
+      const group = groups[chatJid] || groups[base];
+      if (!group) return;
+
+      saveTopicMeta(group.folder, threadId, { topicName });
+      logger.info({ threadId, topicName, folder: group.folder }, 'Forum topic renamed — updated meta');
+    });
 
     // Handle group → supergroup migration (e.g. when Forum Topics are enabled)
     this.bot.on('message:migrate_to_chat_id', (ctx) => {

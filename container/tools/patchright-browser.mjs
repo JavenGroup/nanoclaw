@@ -64,8 +64,10 @@ async function renewProxy(proxy) {
   }
 
   const ispMap = { '电信': 1, '移动': 2, '联通': 3 };
-  const ispCode = ispMap[proxy.ispInput] ?? ispMap[proxy.isp] ?? 0;
-  const url = `https://longterm.proxy.qg.net/get?key=${authKey}&num=1&area=${proxy.areaCode || ''}&isp=${ispCode}&format=json&distinct=true`;
+  const ispName = proxy.ispInput || proxy.isp || process.env.QG_DEFAULT_ISP || '';
+  const ispCode = ispMap[ispName] ?? 0;
+  const areaCode = proxy.areaCode || process.env.QG_DEFAULT_AREA || '';
+  const url = `https://longterm.proxy.qg.net/get?key=${authKey}&num=1&area=${areaCode}&isp=${ispCode}&format=json&distinct=true`;
 
   console.error(`[proxy] IP expired (deadline: ${proxy.deadline}), extracting new IP...`);
   const res = await fetch(url);

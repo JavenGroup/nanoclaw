@@ -22,6 +22,8 @@ import path from 'path';
 const GROUPS_DIR = process.env.GROUPS_DIR || path.join(process.cwd(), 'groups');
 const QG_AUTH_KEY = process.env.QG_AUTH_KEY || '';
 const QG_AUTH_PWD = process.env.QG_AUTH_PWD || '';
+const QG_DEFAULT_AREA = process.env.QG_DEFAULT_AREA || '';
+const QG_DEFAULT_ISP = process.env.QG_DEFAULT_ISP || '不限';
 const PROXY_FILENAME = '.proxy';
 const BROWSER_DATA_DIR = '.browser-data';
 
@@ -129,6 +131,44 @@ class QinguoClient {
     }
     return json.data || [];
   }
+
+  // --- IP Whitelist API (https://proxy.qg.net) ---
+
+  /** Query current whitelist IPs */
+  async whitelistQuery() {
+    const url = `https://proxy.qg.net/whitelist/query?Key=${this.authKey}`;
+    const res = await fetch(url);
+    const json = await res.json();
+    if (json.Code !== 0) {
+      throw new Error(`Whitelist query error: Code ${json.Code}`);
+    }
+    return json.Data || [];
+  }
+
+  /** Add IPs to whitelist (comma-separated string or array) */
+  async whitelistAdd(ips) {
+    const ipStr = Array.isArray(ips) ? ips.join(',') : ips;
+    const url = `https://proxy.qg.net/whitelist/add?Key=${this.authKey}&IP=${ipStr}`;
+    const res = await fetch(url);
+    const json = await res.json();
+    if (json.Code !== 0) {
+      const msgs = { '-1': 'unknown error', '-10': 'invalid params', '-11': 'rate limited', '-100': 'plan expired', '-202': 'whitelist limit exceeded', '-206': 'IP already in use by another key' };
+      throw new Error(`Whitelist add error: Code ${json.Code} — ${msgs[String(json.Code)] || json.Msg || ''}`);
+    }
+    return json.Data || [];
+  }
+
+  /** Remove IPs from whitelist (comma-separated string or array) */
+  async whitelistDel(ips) {
+    const ipStr = Array.isArray(ips) ? ips.join(',') : ips;
+    const url = `https://proxy.qg.net/whitelist/del?Key=${this.authKey}&IP=${ipStr}`;
+    const res = await fetch(url);
+    const json = await res.json();
+    if (json.Code !== 0) {
+      throw new Error(`Whitelist del error: Code ${json.Code}`);
+    }
+    return json.Data || [];
+  }
 }
 
 // --- Proxy file helpers ---
@@ -139,6 +179,16 @@ function proxyPath(topic) {
 
 function readProxy(topic) {
   const p = proxyPath(topic);
+  if (!fs.existsSync(p)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+function readTopicMeta(topic) {
+  const p = path.join(GROUPS_DIR, topic, '.topic-meta.json');
   if (!fs.existsSync(p)) return null;
   try {
     return JSON.parse(fs.readFileSync(p, 'utf-8'));
@@ -272,7 +322,9 @@ async function cmdList() {
 
   for (const t of topics) {
     const p = readProxy(t);
-    console.log(`${t.padEnd(20)} ${(p.proxyIp || '?').padEnd(18)} ${(p.area || '?').padEnd(12)} ${(p.isp || '?').padEnd(6)}  deadline: ${p.deadline || 'unknown'}`);
+    const meta = readTopicMeta(t);
+    const label = meta?.topicName ? `${t} (${meta.topicName})` : t;
+    console.log(`${label.padEnd(30)} ${(p.proxyIp || '?').padEnd(18)} ${(p.area || '?').padEnd(12)} ${(p.isp || '?').padEnd(6)}  deadline: ${p.deadline || 'unknown'}`);
   }
 }
 
@@ -421,6 +473,60 @@ async function cmdResources() {
   }
 }
 
+/** Detect this machine's public IP via httpbin */
+async function getPublicIP() {
+  const res = await fetch('https://httpbin.org/ip');
+  const json = await res.json();
+  return json.origin;
+}
+
+async function cmdWhitelist(action, ipArg) {
+  if (!QG_AUTH_KEY) {
+    console.error('Error: QG_AUTH_KEY environment variable is required');
+    process.exit(1);
+  }
+
+  const client = new QinguoClient(QG_AUTH_KEY);
+
+  switch (action) {
+    case 'add': {
+      const ip = ipArg || await getPublicIP();
+      console.log(`Adding ${ip} to whitelist ...`);
+      const result = await client.whitelistAdd(ip);
+      console.log(`Whitelist now: ${result.join(', ') || '(empty)'}`);
+      break;
+    }
+    case 'del':
+    case 'remove': {
+      if (!ipArg) {
+        console.error('Usage: proxy-manager whitelist del <ip>');
+        process.exit(1);
+      }
+      console.log(`Removing ${ipArg} from whitelist ...`);
+      await client.whitelistDel(ipArg);
+      console.log(`Removed ${ipArg}`);
+      break;
+    }
+    default: {
+      // Default: query / show current whitelist
+      const ips = await client.whitelistQuery();
+      if (ips.length === 0) {
+        console.log('Whitelist is empty.');
+      } else {
+        console.log(`Whitelist (${ips.length}):`);
+        for (const ip of ips) console.log(`  ${ip}`);
+      }
+      // Also show current public IP for reference
+      try {
+        const myIp = await getPublicIP();
+        const inList = ips.includes(myIp);
+        console.log(`\nThis machine: ${myIp} ${inList ? '(in whitelist)' : '(NOT in whitelist)'}`);
+      } catch {}
+      break;
+    }
+  }
+}
+
 // --- CLI entry ---
 
 const [,, cmd, ...args] = process.argv;
@@ -430,8 +536,8 @@ switch (cmd) {
     const topic = args[0];
     const areaIdx = args.indexOf('--area');
     const ispIdx = args.indexOf('--isp');
-    const area = areaIdx >= 0 ? args[areaIdx + 1] : '';
-    const isp = ispIdx >= 0 ? args[ispIdx + 1] : '不限';
+    const area = areaIdx >= 0 ? args[areaIdx + 1] : QG_DEFAULT_AREA;
+    const isp = ispIdx >= 0 ? args[ispIdx + 1] : QG_DEFAULT_ISP;
     if (!topic) {
       console.error('Usage: proxy-manager assign <topic> [--area <code>] [--isp <电信|移动|联通>]');
       process.exit(1);
@@ -459,6 +565,10 @@ switch (cmd) {
     cmdResources().catch(e => { console.error(e.message); process.exit(1); });
     break;
   }
+  case 'whitelist': {
+    cmdWhitelist(args[0], args[1]).catch(e => { console.error(e.message); process.exit(1); });
+    break;
+  }
   default:
     console.log(`Proxy Manager — manage per-workspace residential proxy IPs via Qingguo
 
@@ -469,12 +579,17 @@ Commands:
   query [topic]                                            Query actual in-use IPs from API
   test [topic]                                             Test proxy connectivity (all if omitted)
   resources                                                List available areas & ISPs for key
+  whitelist                                                Show current IP whitelist
+  whitelist add [ip]                                       Add IP to whitelist (auto-detect if omitted)
+  whitelist del <ip>                                       Remove IP from whitelist
 
 Environment:
-  QG_AUTH_KEY   Qingguo API AuthKey (required)
-  QG_AUTH_PWD   Qingguo API AuthPwd (for SOCKS5 auth)
-  GROUPS_DIR    Path to groups directory (default: ./groups)
+  QG_AUTH_KEY       Qingguo API AuthKey (required)
+  QG_AUTH_PWD       Qingguo API AuthPwd (for SOCKS5 auth)
+  QG_DEFAULT_AREA   Default area code for assign (e.g. 440300=深圳)
+  QG_DEFAULT_ISP    Default ISP for assign (电信/移动/联通, default: 不限)
+  GROUPS_DIR        Path to groups directory (default: ./groups)
 
-Area codes: 行政区划代码, e.g. 120100=天津, 310100=上海, 110100=北京
+Area codes: 行政区划代码, e.g. 440300=深圳, 310100=上海, 110100=北京
 ISP values: 电信, 移动, 联通 (default: 不限)`);
 }
