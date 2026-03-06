@@ -64,7 +64,11 @@ npm install
 ## 2. Configure Claude Authentication
 
 Ask the user:
-> Do you want to use your **Claude subscription** (Pro/Max) or an **Anthropic API key**?
+> Choose your AI model provider:
+>
+> 1. **Claude Subscription** (Pro/Max) - Official Claude models
+> 2. **Anthropic API Key** - Use API key to access Claude
+> 3. **智谱 GLM-5.0** - Chinese GLM-5.0 model (requires GLM Coding plan)
 
 ### Option 1: Claude Subscription (Recommended)
 
@@ -79,7 +83,7 @@ Tell the user:
 
 If they give you the token, write it to `.env` using the Write tool. **Never echo the full token in commands or output.**
 
-### Option 2: API Key
+### Option 2: Anthropic API Key
 
 Ask if they have an existing key or need to create one at https://console.anthropic.com/
 
@@ -87,6 +91,28 @@ Write to `.env`:
 ```
 ANTHROPIC_API_KEY=<their-key>
 ```
+
+### Option 3: 智谱 GLM-5.0 (requires GLM Coding plan)
+
+Tell the user:
+> 1. Visit [智谱AI开放平台](https://open.bigmodel.cn/) to register an account
+> 2. Purchase **GLM Coding plan** (supports Claude Code API compatibility)
+> 3. Get API Key from the console
+> 4. Paste the API Key here, or add it to `.env` yourself
+
+If they provide the API Key, write to `.env`:
+
+```
+GLM_API_KEY=<their-key>
+ANTHROPIC_BASE_URL=https://open.bigmodel.cn/api/anthropic
+ANTHROPIC_DEFAULT_HAIKU_MODEL=glm-5.0
+ANTHROPIC_DEFAULT_SONNET_MODEL=glm-5.0
+ANTHROPIC_DEFAULT_OPUS_MODEL=glm-5.0
+API_TIMEOUT_MS=3000000
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+```
+
+**Note:** 智谱 GLM uses a dedicated endpoint. You must configure `ANTHROPIC_BASE_URL` to `https://open.bigmodel.cn/api/anthropic`
 
 ## 3. Install and Configure Lume VM
 
