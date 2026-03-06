@@ -191,6 +191,12 @@ export class TelegramChannel implements Channel {
       ctx.reply(`${ASSISTANT_NAME} is online.`);
     });
 
+    /** Quick check: does this bot own the chat? Skips processing for multi-bot setups. */
+    const isMyChatId = (chatId: number, threadId?: number): boolean => {
+      const jid = buildTopicJid(chatId, threadId);
+      return this.ownsJid(jid);
+    };
+
     this.bot.on('message:text', async (ctx) => {
       if (ctx.message.text.startsWith('/')) return;
 
@@ -199,6 +205,10 @@ export class TelegramChannel implements Channel {
       // using that thread ID for replies causes "message thread not found" errors.
       const threadId = ctx.message.is_topic_message ? ctx.message.message_thread_id : undefined;
       const chatJid = buildTopicJid(ctx.chat.id, threadId);
+
+      // Multi-bot guard: skip if this chat isn't registered to this bot
+      if (!isMyChatId(ctx.chat.id, threadId)) return;
+
       let content = ctx.message.text;
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
       const senderName =
@@ -277,6 +287,7 @@ export class TelegramChannel implements Channel {
     // Handle non-text messages with placeholders
     const storeNonText = (ctx: any, placeholder: string) => {
       const threadId = ctx.message?.is_topic_message ? ctx.message?.message_thread_id : undefined;
+      if (!isMyChatId(ctx.chat.id, threadId)) return;
       const chatJid = buildTopicJid(ctx.chat.id, threadId);
       const groups = this.opts.registeredGroups();
       const group = groups[chatJid] || groups[stripTopicSuffix(chatJid)];
@@ -318,6 +329,7 @@ export class TelegramChannel implements Channel {
 
     this.bot.on('message:photo', async (ctx) => {
       const threadId = ctx.message?.is_topic_message ? ctx.message?.message_thread_id : undefined;
+      if (!isMyChatId(ctx.chat.id, threadId)) return;
       const chatJid = buildTopicJid(ctx.chat.id, threadId);
       const groups = this.opts.registeredGroups();
       const group = groups[chatJid] || groups[stripTopicSuffix(chatJid)];
@@ -397,6 +409,7 @@ export class TelegramChannel implements Channel {
       fallback: string,
     ) => {
       const threadId = ctx.message?.is_topic_message ? ctx.message?.message_thread_id : undefined;
+      if (!isMyChatId(ctx.chat.id, threadId)) return;
       const chatJid = buildTopicJid(ctx.chat.id, threadId);
       const groups = this.opts.registeredGroups();
       if (!groups[chatJid] && !groups[stripTopicSuffix(chatJid)]) {
@@ -462,6 +475,7 @@ export class TelegramChannel implements Channel {
       const fileId = doc?.file_id;
 
       const threadId = ctx.message?.is_topic_message ? ctx.message?.message_thread_id : undefined;
+      if (!isMyChatId(ctx.chat.id, threadId)) return;
       const chatJid = buildTopicJid(ctx.chat.id, threadId);
       const groups = this.opts.registeredGroups();
       const group = groups[chatJid] || groups[stripTopicSuffix(chatJid)];
